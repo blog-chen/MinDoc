@@ -1,0 +1,136 @@
+Link to the video showing the detailed steps to reproduce the issue: https://github.com/blog-chen/MinDoc/blob/main/MinDoc2026-07-30%2016-05-27.mp4
+First Issue
+In the `controllers\CommentController.go` file: The `Lists()` method completely bypasses authorization checks and retrieves comments directly based on the `doc_id`. Although `CommentModel.QueryCommentByDocumentId` internally verifies whether the document corresponding to the `doc_id` exists, it does not verify whether the requester has permission to access that document.
+
+func (c *CommentController) Lists() {
+	docid, _ := c.GetInt("docid", 0)
+	pageIndex, _ := c.GetInt("page", 1)
+
+	// Retrieve comments, pagination
+	comments, count, pageIndex := models.NewComment().QueryCommentByDocumentId(docid, pageIndex, conf.PageSize, c.Member)
+	page := pagination.PageUtil(int(count), pageIndex, conf.PageSize, comments)
+
+	var data struct {
+		DocId int             `json:"doc_id"`
+		Page  pagination.Page `json:"page"`
+	}
+	data.DocId = docid
+	data.Page = page
+
+	c.JsonResult(0, "ok", data)
+	return
+}
+
+http://IP/comment/lists?page=-1&docid=32
+
+Due to the lack of docid authentication for this API, it is possible to retrieve comment information for documents with a docid value—even for private documents.
+
+Second Issue
+In the \mindoc-master\controllers\BlogController.go file: The Index() method only performs password verification for blogs where BlogStatus == “password,” but it does not enforce any access control for blogs in the ‘private’ or “draft” states. Any logged-in user can view another user's private blog or drafts simply by modifying the :id in the URL.
+
+func (c *BlogController) Index() {
+	c.Prepare()
+	c.TplName = "blog/index.tpl"
+	blogId, _ := strconv.Atoi(c.Ctx.Input.Param(":id"))
+
+	if blogId <= 0 {
+		c.ShowErrorPage(404, i18n.Tr(c.Lang, "message.page_not_existed"))
+	}
+	blogReadSession := fmt.Sprintf("blog:read:%d", blogId)
+
+	blog, err := models.NewBlog().FindFromCache(blogId)
+
+	if err != nil {
+		c.ShowErrorPage(404, i18n.Tr(c.Lang, "message.blog_not_existed"))
+	}
+
+	if c.Ctx.Input.IsPost() {
+		password := c.GetString("password")
+		if blog.BlogStatus == "password" && password != blog.Password {
+			c.JsonResult(6001, i18n.Tr(c.Lang, "message.blog_pwd_incorrect"))
+		} else if blog.BlogStatus == "password" && password == blog.Password {
+			// Store the session value for the next GET request.
+			_ = c.CruSession.Set(context.TODO(), blogReadSession, blogId)
+			c.JsonResult(0, "OK")
+		} else {
+			c.JsonResult(0, "OK")
+		}
+	} else if blog.BlogStatus == "password" && c.CruSession.Get(context.TODO(), blogReadSession) == nil && // Read session doesn't exist
+		(c.Member == nil || (blog.MemberId != c.Member.MemberId && !c.Member.IsAdministrator())) { // User isn't author or administrator
+		//If there is no flag indicating that a password has been entered
+		c.TplName = "blog/index_password.tpl"
+	}
+	if blog.BlogType != 1 {
+		//Load Article Attachments
+		_ = blog.LinkAttach()
+	}
+
+	c.Data["Model"] = blog
+	c.Data["Content"] = template.HTML(blog.BlogRelease)
+
+	if blog.BlogExcerpt == "" {
+		c.Data["Description"] = utils.AutoSummary(blog.BlogRelease, 120)
+	} else {
+		c.Data["Description"] = blog.BlogExcerpt
+	}
+
+	if nextBlog, err := models.NewBlog().QueryNext(blogId); err == nil {
+		c.Data["Next"] = nextBlog
+	}
+	if preBlog, err := models.NewBlog().QueryPrevious(blogId); err == nil {
+		c.Data["Previous"] = preBlog
+	}
+}
+
+http://IP/blog-1.html
+The blog feature does not have strict authentication; even if a blog is set to private, other users can still view it without authorization.
+
+Three Issue
+In the `Download()` method of the `\mindoc-master\controllers\BlogController.go` file, the access control condition is `(c.Member == nil && !c.EnableAnonymous) || (blog.BlogStatus == “password” && ...)`. This condition does not cover the ‘private’ and “draft” statuses, allowing an attacker to download attachment files from these blog posts.
+
+func (c *BlogController) Download() {
+	c.Prepare()
+
+	blogId, _ := strconv.Atoi(c.Ctx.Input.Param(":id"))
+	attachId, _ := strconv.Atoi(c.Ctx.Input.Param(":attach_id"))
+	password := c.GetString("password")
+
+	blog, err := models.NewBlog().Find(blogId)
+	if err != nil {
+		if err == orm.ErrNoRows {
+			c.ShowErrorPage(500, i18n.Tr(c.Lang, "message.doc_not_exist"))
+		} else {
+			c.ShowErrorPage(500, i18n.Tr(c.Lang, "message.query_failed"))
+		}
+	}
+	blogReadSession := fmt.Sprintf("blog:read:%d", blogId)
+	//If anonymous access is not enabled, or if an access password has been set
+	if (c.Member == nil && !c.EnableAnonymous) || (blog.BlogStatus == "password" && password != blog.Password && c.CruSession.Get(context.TODO(), blogReadSession) == nil) {
+		c.ShowErrorPage(403, i18n.Tr(c.Lang, "message.no_permission"))
+	}
+
+	// Search for Attachments
+	attachment, err := models.NewAttachment().Find(attachId)
+
+	if err != nil {
+		if err == orm.ErrNoRows {
+			c.ShowErrorPage(404, i18n.Tr(c.Lang, "message.attachment_not_exist"))
+		} else {
+			logs.Error("查询附件时出现异常 -> ", err)
+			c.ShowErrorPage(500, i18n.Tr(c.Lang, "message.query_failed"))
+		}
+	}
+
+	//If the article is linked, you need to verify that the document ID matches. If it does not, ensure that the attachment's item ID is 0 and that the document ID equals the blog post ID.
+	if blog.BlogType == 1 && attachment.DocumentId != blog.DocumentId {
+		c.ShowErrorPage(404, i18n.Tr(c.Lang, "message.attachment_not_exist"))
+	} else if blog.BlogType != 1 && (attachment.BookId != 0 || attachment.DocumentId != blogId) {
+		c.ShowErrorPage(404, i18n.Tr(c.Lang, "message.attachment_not_exist"))
+	}
+
+	c.Ctx.Output.Download(filepath.Join(conf.WorkingDirectory, attachment.FilePath), attachment.FileName)
+	c.StopRun()
+}
+
+http://IP/blog-attach/1/2
+There is no strict authentication for downloading blog attachments, so attachments from any user's private blog can be downloaded.
