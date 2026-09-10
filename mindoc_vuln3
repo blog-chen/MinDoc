@@ -1,0 +1,37 @@
+### 1. Vulnerable code location
+
+The upload handler (`controllers/blog_controller.go`, `/manage/blogs/upload`) stores the file under the static directory and returns a URL directly referencing it — bypassing the authorization-checked download controller:
+
+```json
+// Upload success response (verified)
+{
+  "alt": "attach_18d2566d97ac9b11",
+  "errcode": 0,
+  "message": "ok",
+  "success": 1,
+  "url": "/uploads/blog/202609/attach_18d2566d97ac9b11.png"
+}
+```
+
+The returned `url` points to the site's static directory `/uploads/blog/...`, which is served directly by the Beego `StaticDir` handler without any authorization middleware. The application only enforces blog-status checks on the legacy controller route (`/blog-attach/`), not on the static path returned to the uploader. Static-file GET requests are served by the web server (with the requester's session, or even anonymously) without consulting the blog's visibility status.
+
+### 2. PoC
+
+Detection procedure: the administrator account (highvictim) uploaded an attachment named `private.png` to their **private blog** (blog_id=1, `status=private`), injecting the canary `private` into both the **filename** and the **file content bytes**. The upload response returned the static URL `/uploads/blog/202609/attach_18d2566d97ac9b11.png`. The attacker account (attacker, regular user) then requested the static URL using **its own session cookie**:
+
+```http
+GET /uploads/blog/202609/attach_18d2566d97ac9b11.png HTTP/1.1
+Host: 192.168.233.134:9011
+Cookie: csrftoken=<attacker-csrftoken>; sessionid=<attacker-sessionid>
+```
+
+Response (HTTP 200, PNG file stream) contains the attachment file content:
+
+- The raw file byte stream contains the canary `private` (injected solely into the attachment file content), proving full disclosure of the private blog's attachment file content.
+
+Automated control: the attacker's baseline (browsing the home page and blog lists) does not contain the canary (the private blog is not listed), confirming the leak comes from direct static-path access rather than list visibility.
+
+### 3. Impact
+
+- Any authenticated user can download attachment files of every user's private blog post (documents, images, archives — full original file content);
+- The URL path pattern (`/uploads/blog/<YYYYMM>/<hash>.<ext>`) uses an enumerable naming scheme; combined with in-site attachment references, the URLs are locatable;
