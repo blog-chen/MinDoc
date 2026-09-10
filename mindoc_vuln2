@@ -1,0 +1,56 @@
+### 1. Vulnerable code location
+
+`BlogController.Index()` only gates `password`-status blogs; `private` and `draft` blogs are rendered without any ownership or visibility check:
+
+```go
+func (c *BlogController) Index() {
+    c.Prepare()
+    c.TplName = "blog/index.tpl"
+    blogId, _ := strconv.Atoi(c.Ctx.Input.Param(":id"))
+    ...
+    blog, err := models.NewBlog().FindFromCache(blogId)
+    ...
+    if c.Ctx.Input.IsPost() {
+        password := c.GetString("password")
+        if blog.BlogStatus == "password" && password != blog.Password {
+            c.JsonResult(6001, ...)
+        } else if blog.BlogStatus == "password" && password == blog.Password {
+            _ = c.CruSession.Set(context.TODO(), blogReadSession, blogId)
+            c.JsonResult(0, "OK")
+        } else {
+            c.JsonResult(0, "OK")
+        }
+    } else if blog.BlogStatus == "password" && c.CruSession.Get(...) == nil &&
+        (c.Member == nil || (blog.MemberId != c.Member.MemberId && !c.Member.IsAdministrator())) {
+        c.TplName = "blog/index_password.tpl"   // Gate exists ONLY for password-status blogs
+    }
+    // private / draft blogs: NO ownership check, NO visibility check — rendered directly
+    c.Data["Model"] = blog
+    c.Data["Content"] = template.HTML(blog.BlogRelease)
+    ...
+}
+```
+
+Private-status blog posts do not appear in any list page (home page, personal blog list, or public browse), making this a "hidden direct-URL read" — invisible in listings but fully readable by direct access.
+
+### 2. PoC
+
+Detection procedure: the administrator account (highvictim) created a blog post with `status=private` (blog_id=1), injecting the canary `private_information` into the **title** and `private_information` into the **summary**. The post does not appear on the home page or any blog listing (verified). The attacker account (attacker, regular user) then directly accessed the blog using **its own session cookie**:
+
+```http
+GET /blog-1.html HTTP/1.1
+Host: 192.168.233.134:9011
+Cookie: csrftoken=<attacker-csrftoken>; sessionid=<attacker-sessionid>
+```
+
+Response (HTTP 200, `<title>private_information - ...`) contains the private blog content that the attacker has no permission to read:
+
+- `<title>` renders the private blog **title** canary `private_information`
+- The page body renders the **summary/content** canary `private_information`
+
+Both canaries are present in the attacker's response, proving full disclosure of the private blog's title and content.
+
+### 3. Impact
+
+- Any authenticated user can enumerate the blog ID (sequential) to read all `private` and `draft` blog posts of every user, including administrators;
+- Private blog posts are hidden from all list pages, so victims cannot detect unauthorized reads;
